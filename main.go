@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/caarlos0/env/v11"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -16,11 +18,9 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-)
 
-const USERNAME = "telecomadmin"
-const PASSWORD = "YWRtaW50ZWxlY29t"
-const HOST = "192.168.100.1"
+	log "github.com/sirupsen/logrus"
+)
 
 var opticInfoArray = []byte("var opticInfos = new Array(new stOpticInfo(")
 var deviceCpuUsed = []byte("var cpuUsed = '")
@@ -29,44 +29,28 @@ var deviceCpuTemp = []byte("var CpuTemperature = '")
 
 var loggedOutBuf = []byte("<title>Waiting...")
 
-var (
-	opticalTxPower = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "ont_optical_power_tx_dbm",
-		Help: "Optical TX Power in dBm",
+var metrics map[string]*prometheus.Gauge
+
+type envDef struct {
+	Username      string `env:"USERNAME" envDefault:"telecomadmin"`
+	Password      string `env:"PASSWORD" envDefault:"admintelecom"`
+	OntAddress    string `env:"ONT_ADDRESS" envDefault:"192.168.100.1"`
+	ListenAddress string `env:"LISTEN_ADDRESS" envDefault:"[::]:19143"`
+}
+
+var config envDef
+
+func AddMetrics(name string, help string) {
+	gauge := promauto.NewGauge(prometheus.GaugeOpts{
+		Name: name,
+		Help: help,
 	})
-	opticalRxPower = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "ont_optical_power_rx_dbm",
-		Help: "Optical RX Power in dBm",
-	})
-	opticalWorkingVoltagemV = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "ont_optical_working_voltage_mv",
-		Help: "Optics working voltage in mV",
-	})
-	opticalTemperature = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "ont_optical_working_temperature_c",
-		Help: "Optics temperature",
-	})
-	opticalBiasCurrentMa = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "ont_optical_bias_mv",
-		Help: "Optics bias current in mA",
-	})
-	systemCpuUsage = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "system_cpu_usage_pct",
-		Help: "CPU usage in percent",
-	})
-	systemMemUsage = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "system_mem_usage_pct",
-		Help: "Memory usage in percent",
-	})
-	systemTemperature = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "system_cpu_temp_c",
-		Help: "CPU temperature",
-	})
-)
+	metrics[name] = &gauge
+}
 
 func login(c *http.Client) (err error) {
-	fmt.Println("logging in")
-	rsp, err := c.Get(fmt.Sprintf("http://%s/asp/GetRandCount.asp", HOST))
+	log.Info("logging in")
+	rsp, err := c.Get(fmt.Sprintf("http://%s/asp/GetRandCount.asp", config.OntAddress))
 	if err != nil {
 		return
 	}
@@ -75,22 +59,33 @@ func login(c *http.Client) (err error) {
 	csrf := string(b)
 	csrf = csrf[3:]
 	payload := url.Values{
-		"UserName":     []string{USERNAME},
-		"PassWord":     []string{PASSWORD},
+		"UserName":     []string{config.Username},
+		"PassWord":     []string{config.Password},
 		"Language":     []string{"english"},
 		"x.X_HW_Token": []string{csrf},
 	}
-	_, err = c.PostForm("http://192.168.100.1/login.cgi", payload)
+	_, err = c.PostForm(fmt.Sprintf("http://%s/login.cgi", config.OntAddress), payload)
 	if err != nil {
+		log.Error(err)
 		return
 	}
-	/* FIXME: check is login is successful
+	/* TODO: check if login is successful
 	b, err = io.ReadAll(rsp.Body)
 	if err != nil {
 		return
 	}
 	rsp.Body.Close()
 	*/
+	url, err := url.Parse(fmt.Sprintf("http://%s/", config.OntAddress))
+	if err != nil {
+		log.Panic("error parsing URL")
+	}
+	cookies := c.Jar.Cookies(url)
+	if len(cookies) < 1 {
+		log.Panic("login failed")
+	} else {
+		log.Info("login successful")
+	}
 	return
 }
 
@@ -102,14 +97,54 @@ func unescapeLiteral(s string) (rv string) {
 	return
 }
 
-func strLiteralToFloat(b string) (fl float64, err error) {
-	fok := unescapeLiteral(b)
-	fl, err = strconv.ParseFloat(fok, 64)
+func UpdateMetrics(s string, metricsName string) (err error) {
+	raw := s
+	if strings.Contains(s, "\\") {
+		s = unescapeLiteral(s)
+	}
+
+	if metrics, ok := metrics[metricsName]; ok {
+		var value float64
+		value, err = strconv.ParseFloat(s, 64)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"value":         value,
+				"raw_string":    raw,
+				"parsed_string": s,
+				"metrics_name":  metricsName,
+				"err":           err,
+			}).Error("could not parse value")
+			return
+		}
+		(*metrics).Set(value)
+		log.WithFields(log.Fields{
+			"value":         value,
+			"raw_string":    raw,
+			"parsed_string": s,
+			"metrics_name":  metricsName,
+		}).Info("updated metric")
+
+	} else {
+		log.WithFields(log.Fields{
+			"metrics_name": metricsName,
+		}).Error("metrics with given name could not be found")
+	}
 	return
 }
 
+func SetupMetrics() {
+	AddMetrics("ont_optical_power_tx_dbm", "Optical TX Power in dBm")
+	AddMetrics("ont_optical_power_rx_dbm", "Optical RX Power in dBm")
+	AddMetrics("ont_optical_working_voltage_mv", "Optics working voltage in mV")
+	AddMetrics("ont_optical_working_temperature_c", "Optics temperature")
+	AddMetrics("ont_optical_bias_mv", "Optics bias current in mA")
+	AddMetrics("system_cpu_usage_pct", "CPU usage in percent")
+	AddMetrics("system_mem_usage_pct", "Memory usage in percent")
+	AddMetrics("system_cpu_temp_c", "CPU temperature")
+}
+
 func fetch(c *http.Client) (err error) {
-	rsp, err := c.Get(fmt.Sprintf("http://%s/html/amp/opticinfo/opticinfo.asp", HOST))
+	rsp, err := c.Get(fmt.Sprintf("http://%s/html/amp/opticinfo/opticinfo.asp", config.OntAddress))
 	if err != nil {
 		return
 	}
@@ -126,46 +161,27 @@ func fetch(c *http.Client) (err error) {
 		if len(b) > len(opticInfoArray) && bytes.Equal(b[:len(opticInfoArray)], opticInfoArray) {
 			s := scanner.Text()
 			sp := strings.SplitN(s, "\"", 15)
-			fl, err := strLiteralToFloat(sp[5])
-			if err != nil {
-				return err
-			}
-			opticalTxPower.Set(fl)
 
-			fl, err = strLiteralToFloat(sp[7])
-			opticalRxPower.Set(fl)
-			if err != nil {
-				return err
-			}
-
-			fl, err = strconv.ParseFloat(sp[9], 64)
-			if err != nil {
-				return err
-			}
-			opticalWorkingVoltagemV.Set(fl)
-
-			fl, err = strconv.ParseFloat(sp[11], 64)
-			if err != nil {
-				return err
-			}
-			opticalTemperature.Set(fl)
-
-			fl, err = strconv.ParseFloat(sp[13], 64)
-			if err != nil {
-				return err
-			}
-			opticalBiasCurrentMa.Set(fl)
+			UpdateMetrics(sp[5], "ont_optical_power_tx_dbm")
+			UpdateMetrics(sp[7], "ont_optical_power_rx_dbm")
+			UpdateMetrics(sp[9], "ont_optical_working_voltage_mv")
+			UpdateMetrics(sp[11], "ont_optical_working_temperature_c")
+			UpdateMetrics(sp[13], "ont_optical_bias_mv")
 			break
 		}
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
+		log.WithFields(log.Fields{
+			"scanner": "first",
+		}).Error(scanErr)
 		return scanErr
 	}
 
 	rsp.Body.Close()
 
-	rsp, err = c.Get(fmt.Sprintf("http://%s/html/ssmp/deviceinfo/deviceinfocut.asp", HOST))
+	rsp, err = c.Get(fmt.Sprintf("http://%s/html/ssmp/deviceinfo/deviceinfocut.asp", config.OntAddress))
 	if err != nil {
+		log.Error(err)
 		return
 	}
 
@@ -180,31 +196,24 @@ func fetch(c *http.Client) (err error) {
 		if len(b) > len(deviceCpuUsed) && bytes.Equal(b[:len(deviceCpuUsed)], deviceCpuUsed) {
 			s := scanner.Text()
 			sp := strings.SplitN(s, "'", 15)
-			cpuUsage, err := strconv.ParseFloat(strings.Replace(sp[1], "%", "", 1), 64)
-			if err != nil {
-				return err
-			}
-			systemCpuUsage.Set(cpuUsage)
+			sp[1] = strings.Replace(sp[1], "%", "", 1)
+			UpdateMetrics(sp[1], "system_cpu_usage_pct")
 		} else if len(b) > len(deviceMemUsed) && bytes.Equal(b[:len(deviceMemUsed)], deviceMemUsed) {
 			s := scanner.Text()
 			sp := strings.SplitN(s, "'", 15)
-			memUsage, err := strconv.ParseFloat(strings.Replace(sp[1], "%", "", 1), 64)
-			if err != nil {
-				return err
-			}
-			systemMemUsage.Set(memUsage)
+			sp[1] = strings.Replace(sp[1], "%", "", 1)
+			UpdateMetrics(sp[1], "system_mem_usage_pct")
 		} else if len(b) > len(deviceCpuTemp) && bytes.Equal(b[:len(deviceCpuTemp)], deviceCpuTemp) {
 			s := scanner.Text()
 			sp := strings.SplitN(s, "'", 15)
-			cpuTemp, err := strconv.ParseFloat(sp[1], 64)
-			if err != nil {
-				return err
-			}
-			systemTemperature.Set(cpuTemp)
+			UpdateMetrics(sp[1], "system_cpu_temp_c")
 			break
 		}
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
+		log.WithFields(log.Fields{
+			"scanner": "first",
+		}).Error(scanErr)
 		return scanErr
 	}
 
@@ -212,9 +221,22 @@ func fetch(c *http.Client) (err error) {
 }
 
 func main() {
+	err := env.ParseWithOptions(&config, env.Options{
+		Prefix: "HUAWEI_EXPORTER_",
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	config.Password = base64.StdEncoding.EncodeToString([]byte(config.Password))
+
+	metrics = make(map[string]*prometheus.Gauge)
+	SetupMetrics()
+	log.SetLevel(log.WarnLevel)
 
 	jar, err := cookiejar.New(nil)
 	if err != nil {
+		log.Error(err)
 		panic(err)
 	}
 
@@ -235,25 +257,22 @@ func main() {
 						login(client)
 						err = fetch(client)
 						if err != nil {
+							log.Error(err)
 							panic(err)
 						}
 					} else {
+						log.Error(err)
 						panic(err)
 					}
 				}
 			}
 		}
 	}()
-	/*
-		time.Sleep(60 * time.Second)
-		ticker.Stop()
-		done <- true
-		fmt.Println("Ticker stopped")
-	*/
+
 	http.Handle("/metrics", promhttp.Handler())
-	err = http.ListenAndServe("127.0.0.1:9443", nil)
+	err = http.ListenAndServe(config.ListenAddress, nil)
 	if err != nil {
+		log.Error(err)
 		panic(err)
 	}
-	//c.Visit(fmt.Sprintf("http://%s/asp/GetRandCount.asp", HOST))
 }
